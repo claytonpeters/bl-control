@@ -11,15 +11,27 @@ use tokio::sync::mpsc;
 use clap::Parser;
 use clap_num::maybe_hex;
 
+// Constants from /usr/include/linux/input-event-codes.h
+const EV_KEY: u16 = 0x01;
+const KEY_LEFT_META: u16 = 125;
+const KEY_RIGHT_META: u16 = 125;
+const KEY_L: u16 = 38;
+
 #[derive(Parser)]
 #[command(version, about = "Controls the dimming of the keyboard backlight", long_about = None)]
 struct Cli {
+    /// The USB Vendor ID of the controller
     #[arg(short, long, value_parser=maybe_hex::<u16>, default_value_t=1165)]
     vendor_id: u16,
+    /// The USB Product ID of the controller
     #[arg(short, long, value_parser=maybe_hex::<u16>)]
     product_id: u16,
+    /// The number of seconds to wait after a keypress before dimming
     #[arg(short, long, default_value_t = 5.0)]
-    timeout: f64
+    timeout: f64,
+    /// Whether to dim the keyboard when Meta+L is pressed
+    #[arg(short, long)]
+    lock: bool
 }
 
 
@@ -152,7 +164,7 @@ fn read_brightness_level(handle: &mut libusb::DeviceHandle) -> Result<u8, String
         },
         _ => ()
     }
-    
+
     // Read the brightness
     // request 0x01 is HID get_report
     // value 0x0300 is HID feature
@@ -187,7 +199,7 @@ fn set_backlight_level(handle: &mut libusb::DeviceHandle, level: u8) {
 
     // Set up the request type
     let request_type = libusb::request_type(libusb::Direction::Out, libusb::RequestType::Class, libusb::Recipient::Interface);
-    
+
     // request 0x09 is HID set_report
     // value 0x0300 is HID feature
     // index 0x0001 is whatever
@@ -220,7 +232,7 @@ async fn main() {
         Ok(context) => context,
         Err(e) => panic!("could not initialise libusb: {}", e)
     };
-    
+
     // Open the USB device
     let mut handle = match context.open_device_with_vid_pid(args.vendor_id, args.product_id) {
         Some(handle) => {
@@ -255,15 +267,43 @@ async fn main() {
         // Debug
         println!("Input thread running");
 
+        // Flag to keep track of Meta (Windows) key states
+        let mut meta_l_down = false;
+        let mut meta_r_down = false;
+
         // Read up to 24 bytes
         loop {
             let count = file.read(&mut buf).expect("Failed to read");
             if count < 24 {
                 println!("Warning - too few bytes read");
             }
-            match s.send(0) {
-                Err(e) => println!("{}", e),
-                Ok(_) => ()
+
+            // Parse the data to see what keys were pressed
+            let in_type = (buf[17] as u16) << 8 | (buf[16] as u16);
+            let code = (buf[19] as u16) << 8 | (buf[18] as u16);
+            let value = (buf[23] as u32) << 24 | (buf[22] as u32) << 16 | (buf[21] as u32) << 8 | (buf[20] as u32);
+
+            // Keep track if the Meta (Windows) key is down
+            if in_type == EV_KEY {
+                if code == KEY_LEFT_META {
+                    meta_l_down = value > 0;
+                } else if code == KEY_RIGHT_META {
+                    meta_r_down = value > 0;
+                }
+            }
+
+            // Check for a Meta+L combination key release
+            let result = match in_type == EV_KEY && value == 0 && code == KEY_L && (meta_l_down || meta_r_down) {
+                true => 1,
+                false => 0
+            };
+
+            // Only send events on a key-up / key-down / key-repeat
+            if in_type == EV_KEY {
+                match s.send(result) {
+                    Err(e) => println!("{}", e),
+                    Ok(_) => ()
+                }
             }
         }
     });
@@ -282,6 +322,9 @@ async fn main() {
     // Flag to indicate if we currently think the backlight should be on (even
     // if it's at a requested level of zero)
     let mut is_active = true;
+
+    // How many future key events to ignore
+    let mut ignore_next = 0;
 
     // Loop forever
     loop {
@@ -306,14 +349,28 @@ async fn main() {
         // Wait for one of the tasks to complete
         tokio::select! {
             // Keypress
-            _ = recv_task => {
-                // Key was pressed, stop dimming, set active and change the
-                // backlight level if it's not current what the user set it to
-                is_active = true;
-                dimming = false;
-                if level != requested_level {
-                    level = requested_level;
-                    set_backlight_level(&mut handle, level);
+            lock = recv_task => {
+                // Ignore events if we're asked to
+                if ignore_next > 0 {
+                    ignore_next = ignore_next - 1;
+                } else {
+                    // If the result back was a lockscreen (and dim-on-locking is enabled)
+                    if args.lock && lock.unwrap() == 1 {
+                        // Ignore the next key event (so the Meta up doesn't trigger the backlight)
+                        ignore_next = 1;
+
+                        // Take us to dimming
+                        dimming = true;
+                    } else {
+                        // Key was pressed, stop dimming, set active and change the
+                        // backlight level if it's not current what the user set it to
+                        is_active = true;
+                        dimming = false;
+                        if level != requested_level {
+                            level = requested_level;
+                            set_backlight_level(&mut handle, level);
+                        }
+                    }
                 }
             },
 

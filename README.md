@@ -31,6 +31,8 @@ The parameters are as follows:
 * `-p` / `--product-id`: The product ID of the USB edvice
 * `-t` / `--timeout`: The number of seconds to leave the backlight on after the 
 last keypress before dimming the backlight
+* `-l` / `--lock`: Dim the backlight immediately when Meta+L is pressed (i.e.
+when the lockscreen is triggered)
 
 The vendor ID will almost certainly alays be `0x048d` and this is the default if
 it is not given. The product ID can vary depending on the chip in use. This
@@ -62,7 +64,7 @@ Description=Keyboard backlight control
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/bl-control -v 0x048d -p 0x6004 -t 60 
+ExecStart=/usr/local/bin/bl-control -v 0x048d -p 0x6004 -t 60 -l
 
 [Install]
 WantedBy=multi-user.target
