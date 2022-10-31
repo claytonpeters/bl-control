@@ -212,6 +212,22 @@ fn set_backlight_level(handle: &mut libusb::DeviceHandle, level: u8) {
 }
 
 
+// Returns the current brightness level or a default
+fn get_updated_requested_level(handle: &mut libusb::DeviceHandle, level: u8) -> u8 {
+    // Read the current brightness level as the user may have
+    // changed it via the keyboard
+    return match read_brightness_level(handle) {
+        Ok(l) => {
+            l
+        }
+        Err(e) => {
+            println!("Failed to get current brightness: {}", e);
+            level
+        }
+    };
+}
+
+
 // Entry point
 #[tokio::main(worker_threads=2)]
 async fn main() {
@@ -243,16 +259,7 @@ async fn main() {
     };
 
     // Read the current brightness level
-    let mut requested_level = match read_brightness_level(&mut handle) {
-        Ok(l) => {
-            println!("Startup Backlight Level: {}", l);
-            l
-        }
-        Err(e) => {
-            println!("Failed to get current brightness: {}", e);
-            50
-        }
-    };
+    let mut requested_level = get_updated_requested_level(&mut handle, 50);
 
     // Create a thread that posts to a channel when it's able to read
     let (s, mut r) = mpsc::unbounded_channel();
@@ -356,11 +363,22 @@ async fn main() {
                 } else {
                     // If the result back was a lockscreen (and dim-on-locking is enabled)
                     if args.lock && lock.unwrap() == 1 {
-                        // Ignore the next key event (so the Meta up doesn't trigger the backlight)
-                        ignore_next = 1;
+                        // Only trigger is active otherwise we could set the requested
+                        // level hwiles dimming
+                        if is_active {
+                            // Ignore the next couple of events (so the Meta or L up doesn't trigger the backlight)
+                            ignore_next = 2;
 
-                        // Take us to dimming
-                        dimming = true;
+                            // Take us to dimming
+                            is_active = false;
+                            requested_level = get_updated_requested_level(&mut handle, level);
+                            level = requested_level;
+
+                            // Flag up that we're currently dimming
+                            if requested_level > 0 {
+                                dimming = true;
+                            }
+                        }
                     } else {
                         // Key was pressed, stop dimming, set active and change the
                         // backlight level if it's not current what the user set it to
@@ -376,24 +394,18 @@ async fn main() {
 
             // Timeout
             _ = timeout_task => {
-                // No key has been pressed recently, so we're definitely inactive
-                // (and possibly already dimming)
-                is_active = false;
+                // No key has been pressed recently, so we're definitely now
+                // inactive (and possibly already dimming)
 
-                // If we're starting to dim...
-                if !dimming {
-                    // Read the current brightness level as the user may have
-                    // changed it via the keyboard
-                    match read_brightness_level(&mut handle) {
-                        Ok(l) => {
-                            requested_level = l;
-                            level = l;
-                        }
-                        Err(e) => {
-                            println!("Failed to get current brightness: {}", e);
-                            requested_level = level;
-                        }
-                    };
+                // If we're starting to dim and currently active (otherwise
+                // we'll trigger a dim when we're already dimmed which will
+                // set requested_level to zero!)
+                if is_active && !dimming {
+                    // We're on longer active
+                    is_active = false;
+
+                    requested_level = get_updated_requested_level(&mut handle, level);
+                    level = requested_level;
 
                     // Flag up that we're currently dimming
                     if requested_level > 0 {
@@ -402,7 +414,7 @@ async fn main() {
                 }
 
                 // Update the backlight level
-                if level != 0 {
+                if dimming && level != 0 {
                     // The brightness is non-linear so change the dimming speed
                     // based on the current level
                     if level >= 10 {
