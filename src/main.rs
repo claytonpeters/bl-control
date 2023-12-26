@@ -31,7 +31,16 @@ struct Cli {
     timeout: f64,
     /// Whether to dim the keyboard when Meta+L is pressed
     #[arg(short, long)]
-    lock: bool
+    lock: bool,
+    /// Color to set at startup, red component
+    #[arg(short, long, value_parser=maybe_hex::<u8>, default_value_t=0)]
+    red: u8,
+    /// Color to set at startup, green component
+    #[arg(short, long, value_parser=maybe_hex::<u8>, default_value_t=0)]
+    green: u8,
+    /// Color to set at startup, blue component
+    #[arg(short, long, value_parser=maybe_hex::<u8>, default_value_t=0)]
+    blue: u8
 }
 
 
@@ -212,6 +221,44 @@ fn set_backlight_level(handle: &mut libusb::DeviceHandle, level: u8) {
 }
 
 
+// Sets the keyboard backlight color
+fn set_backlight_color(handle: &mut libusb::DeviceHandle, r: u8, g: u8, b: u8) {
+    let is_active = take_control(handle);
+
+    match handle.claim_interface(1) {
+        Err(e) => {
+            println!("Claim Error: {}", e);
+            return;
+        },
+        _ => ()
+    }
+
+    // Set up the request type
+    let request_type = libusb::request_type(libusb::Direction::Out, libusb::RequestType::Class, libusb::Recipient::Interface);
+
+    // request 0x09 is HID set_report
+    // value 0x0300 is HID feature
+    // index 0x0001 is whatever
+    let data: [u8; 8] = [0x12, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00];
+    match handle.write_control(request_type, 0x09, 0x0300, 0x0001, &data, Duration::from_secs(1)) {
+        Err(e) => println!("Error: {}", e),
+        _ => ()
+    }
+
+    // Send the color eight times for the eight zones (we send to endpoint 2, which is the output
+    // endpoint
+    for _ in 0..8 {
+        let color_data: [u8; 64] = [0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b, 0, r, g, b];
+        match handle.write_bulk(2, &color_data, Duration::from_secs(1)) {
+            Err(e) => println!("Error: {}", e),
+            _ => ()
+        }
+    }
+
+    release_control(handle, is_active);
+
+}
+
 // Returns the current brightness level or a default
 fn get_updated_requested_level(handle: &mut libusb::DeviceHandle, level: u8) -> u8 {
     // Read the current brightness level as the user may have
@@ -260,6 +307,7 @@ async fn main() {
 
     // Read the current brightness level
     let mut requested_level = get_updated_requested_level(&mut handle, 50);
+    println!("Initial backlight level is {}", requested_level);
 
     // Create a thread that posts to a channel when it's able to read
     let (s, mut r) = mpsc::unbounded_channel();
@@ -290,23 +338,22 @@ async fn main() {
             let code = (buf[19] as u16) << 8 | (buf[18] as u16);
             let value = (buf[23] as u32) << 24 | (buf[22] as u32) << 16 | (buf[21] as u32) << 8 | (buf[20] as u32);
 
-            // Keep track if the Meta (Windows) key is down
+            // Only handle events on a key-up / key-down / key-repeat
             if in_type == EV_KEY {
+                // Keep track if the Meta (Windows) key is down
                 if code == KEY_LEFT_META {
                     meta_l_down = value > 0;
                 } else if code == KEY_RIGHT_META {
                     meta_r_down = value > 0;
                 }
-            }
 
-            // Check for a Meta+L combination key release
-            let result = match in_type == EV_KEY && value == 0 && code == KEY_L && (meta_l_down || meta_r_down) {
-                true => 1,
-                false => 0
-            };
+                // Check for a Meta+L combination key release
+                let result = match value == 0 && code == KEY_L && (meta_l_down || meta_r_down) {
+                    true => 1,
+                    false => 0
+                };
 
-            // Only send events on a key-up / key-down / key-repeat
-            if in_type == EV_KEY {
+                // Send the event
                 match s.send(result) {
                     Err(e) => println!("{}", e),
                     Ok(_) => ()
@@ -321,7 +368,17 @@ async fn main() {
 
     // Turn the backlight on
     let mut level = requested_level;
+    if level == 0 {
+        println!("Initial level was 0, resetting to 50");
+        level = 50;
+    }
     set_backlight_level(&mut handle, level);
+
+    // If the color is given, set it on the device
+    if args.red > 0 || args.green > 0 || args.blue > 0 {
+        println!("Setting color to {}, {}, {}", args.red, args.green, args.blue);
+        set_backlight_color(&mut handle, args.red, args.green, args.blue);
+    }
 
     // Flag to indicate if we're currently dimming the backlight
     let mut dimming = false;
@@ -363,8 +420,8 @@ async fn main() {
                 } else {
                     // If the result back was a lockscreen (and dim-on-locking is enabled)
                     if args.lock && lock.unwrap() == 1 {
-                        // Only trigger is active otherwise we could set the requested
-                        // level hwiles dimming
+                        // Only trigger if active otherwise we could set the requested
+                        // level whilst dimming
                         if is_active {
                             // Ignore the next couple of events (so the Meta or L up doesn't trigger the backlight)
                             ignore_next = 2;
